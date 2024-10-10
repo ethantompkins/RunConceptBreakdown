@@ -6,105 +6,112 @@ library(nflreadr)
 library(nflplotR)
 library(nflverse)
 library(ggplot2)
-library(DT)
+library(gt)
+library(stringr)
 
-# Load the play-by-play data from nflfastr
-pbp_data <- load_pbp(seasons = 2023)
+# Load the play-by-play data from nflfastr for the 2024 season
+pbp_data <- load_pbp(seasons = 2024)
 
-# Define run concepts
-run_concepts <- list(
-  "Gap Scheme" = c("Man/Duo", "Power", "Draw", "Counter", "Trap"),
-  "Zone Scheme" = c("Inside Zone", "Outside Zone"),
-  "Other" = c("Scramble", "Trick/WR Run", "QB Sneak")
-)
-
-# Create a function to process data
-process_run_data <- function(team_abbr) {
+# Create a function to process player performance data for a team
+process_player_data <- function(team_abbr) {
   team_pbp <- pbp_data %>% 
-    filter(posteam == team_abbr, play_type == "run")
+    filter(posteam == team_abbr, play_type %in% c("pass", "run"))
   
-  run_data <- team_pbp %>% 
-    group_by(run_concept = case_when(
-      str_detect(desc, "Duo|Man") ~ "Man/Duo",
-      str_detect(desc, "Power") ~ "Power",
-      str_detect(desc, "Draw") ~ "Draw",
-      str_detect(desc, "Counter") ~ "Counter",
-      str_detect(desc, "Trap") ~ "Trap",
-      str_detect(desc, "Inside Zone") ~ "Inside Zone",
-      str_detect(desc, "Outside Zone") ~ "Outside Zone",
-      str_detect(desc, "Scramble") ~ "Scramble",
-      str_detect(desc, "Trick|End Around|Jet Sweep|WR Run") ~ "Trick/WR Run",
-      str_detect(desc, "QB Sneak") ~ "QB Sneak",
-      TRUE ~ "Other"
-    )) %>%
+  player_data <- team_pbp %>%
+    group_by(player_name = if_else(play_type == "pass", receiver_player_name, rusher_player_name)) %>%
+    filter(!is.na(player_name)) %>%
     summarise(
-      attempts = n(),
+      targets = sum(!is.na(receiver_player_name) & play_type == "pass", na.rm = TRUE),
+      receptions = sum(complete_pass == 1, na.rm = TRUE),
+      receiving_yards = sum(yards_gained * (play_type == "pass"), na.rm = TRUE),
+      carries = sum(!is.na(rusher_player_name) & play_type == "run", na.rm = TRUE),
+      rushing_yards = sum(yards_gained * (play_type == "run"), na.rm = TRUE),
       total_yards = sum(yards_gained, na.rm = TRUE),
-      epa_per_play = mean(epa, na.rm = TRUE)
+      touchdowns = sum(touchdown, na.rm = TRUE),
+      epa_per_play = mean(epa, na.rm = TRUE),
+      fantasy_ppr = sum(yards_gained * 0.1 + touchdowns * 6 + receptions, na.rm = TRUE),
+      fantasy_half_ppr = sum(yards_gained * 0.1 + touchdowns * 6 + receptions * 0.5, na.rm = TRUE)
     ) %>%
     mutate(
-      run_pct = attempts / sum(attempts),
-      run_pct_rank = rank(-run_pct)
+      productivity_rank = rank(-total_yards)
     ) %>%
-    arrange(desc(run_pct))
+    arrange(desc(total_yards))
   
-  return(run_data)
+  return(player_data)
 }
 
 # Define UI for Shiny app
 ui <- fluidPage(
-  titlePanel("NFL Team Run Concept Breakdown"),
+  titlePanel("NFL Team Player Performance Tracker - 2024 Season"),
   sidebarLayout(
     sidebarPanel(
-      selectInput("team", "Select a Team:", choices = unique(pbp_data$posteam)),
-      helpText("Select an NFL team to see its run concept breakdown.")
+      selectInput("team", "Select a Team:", choices = unique(pbp_data$posteam), width = '100%'),
+      helpText("Select an NFL team to see its top offensive players' performance for the 2024 season."),
+      width = 2
     ),
     mainPanel(
-      DTOutput("run_table"),
-      plotOutput("run_plot")
+      width = 10,
+      gt_output("player_table"),
+      plotOutput("player_plot")
     )
   )
 )
 
 # Define server logic for Shiny app
 server <- function(input, output) {
-  run_data <- reactive({
-    process_run_data(input$team)
+  player_data <- reactive({
+    process_player_data(input$team)
   })
   
-  output$run_table <- renderDT({
-    run_data() %>% 
-      mutate(
-        concept_category = case_when(
-          run_concept %in% run_concepts[["Gap Scheme"]] ~ "Gap Scheme",
-          run_concept %in% run_concepts[["Zone Scheme"]] ~ "Zone Scheme",
-          run_concept %in% run_concepts[["Other"]] ~ "Other",
-          TRUE ~ "Other"
-        )
+  output$player_table <- render_gt({
+    player_data() %>%
+      gt() %>%
+      tab_header(
+        title = html(if (is.null(input$team) || input$team == "") {
+          "Player Performance Breakdown"
+        } else {
+          paste0("Player Performance Breakdown: <img src='https://a.espncdn.com/combiner/i?img=/i/teamlogos/nfl/500/", tolower(input$team), ".png' width='30' style='vertical-align:middle;'>")
+        }),
+        subtitle = "Data through the 2024 NFL Season"
       ) %>%
-      arrange(concept_category, desc(run_pct)) %>%
-      datatable(
-        options = list(pageLength = 15),
-        rownames = FALSE,
-        colnames = c("Concept Category", "Run Concept", "Attempts", "Total Yards", "EPA/Play", "Run %", "Run % Rank"),
-        extensions = 'Buttons',
-        class = 'stripe hover row-border',
-        callback = JS('table.on("order.dt", function() { table.column(0).nodes().to$().css({"background-color": "#f0f0f0"}); });')
+      cols_label(
+        player_name = "Player Name",
+        targets = "Targets",
+        receptions = "Receptions",
+        receiving_yards = "Receiving Yards",
+        carries = "Carries",
+        rushing_yards = "Rushing Yards",
+        total_yards = "Total Yards",
+        touchdowns = "Touchdowns",
+        epa_per_play = "EPA/Play",
+        fantasy_ppr = "PPR Fantasy Points",
+        fantasy_half_ppr = "Half PPR Fantasy Points",
+        productivity_rank = "Productivity Rank"
       ) %>%
-      formatPercentage("run_pct", 1) %>%
-      formatRound(columns = c("epa_per_play", "total_yards"), digits = 2)
+      fmt_number(
+        columns = c("epa_per_play", "total_yards", "touchdowns", "fantasy_ppr", "fantasy_half_ppr", "receiving_yards", "rushing_yards"),
+        decimals = 2
+      ) %>%
+      cols_align(
+        align = "center",
+        columns = everything()
+      ) %>%
+      tab_source_note(
+        source_note = md("Data: nflfastR & nflverse | Table: User-Generated")
+      )
   })
   
-  output$run_plot <- renderPlot({
-    run_data() %>% 
-      ggplot(aes(x = reorder(run_concept, -run_pct), y = run_pct, fill = run_concept)) +
+  output$player_plot <- renderPlot({
+    player_data() %>%
+      ggplot(aes(x = reorder(player_name, -total_yards), y = total_yards, fill = player_name)) +
       geom_bar(stat = "identity") +
-      geom_text(aes(label = paste0("Rank: ", run_pct_rank)), vjust = -0.5) +
+      geom_nfl_headshots(aes(player_gsis = player_name), height = 0.08) +
+      geom_nfl_logos(aes(team_abbr = input$team), height = 0.1) +
       labs(
-        title = paste("Run Concept Breakdown for", input$team),
-        x = "Run Concept",
-        y = "Run %",
-        fill = "Run Concept"
+        title = paste("Top Offensive Players for", input$team, "- 2024 Season"),
+        x = "Player Name",
+        y = "Total Yards",
+        fill = "Player Name"
       ) +
       theme_minimal() +
       theme(axis.text.x = element_text(angle = 45, hjust = 1))
